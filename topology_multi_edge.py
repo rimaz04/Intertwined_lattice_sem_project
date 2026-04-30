@@ -1,5 +1,6 @@
 from collections import Counter, defaultdict
-from itertools import combinations, permutations
+from itertools import combinations, permutations, product
+import math
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -194,6 +195,7 @@ class TopologyMultiEdge:
 
         self.valid_collections = set()
         self.solutions = []
+        self.strand_solutions = {}
 
     def is_valid_path(self, path):
         """Same path validity logic as original port-level solver."""
@@ -596,6 +598,345 @@ class TopologyMultiEdge:
         plt.tight_layout()
         plt.show()
 
+    def _expand_solution_instances(self, solution_index, sort_paths=True):
+        """Expand one port-level solution into individual path instances."""
+        if not self.solutions:
+            raise ValueError("No solutions computed. Run generate_solutions() first.")
+        if solution_index < 0 or solution_index >= len(self.solutions):
+            raise IndexError(f"solution_index {solution_index} out of range [0, {len(self.solutions)-1}]")
+
+        items = list(self.solutions[solution_index])
+        if sort_paths:
+            # Longer paths first usually prunes strand backtracking faster.
+            items = sorted(items, key=lambda x: (-len(x[0]), x[0], x[1]))
+
+        instances = []
+        for path, multiplicity in items:
+            for _ in range(multiplicity):
+                instances.append(tuple(path))
+        return instances
+
+    def _canonicalize_strand_solution(self, strand_solution):
+        """Canonicalize one strand assignment modulo per-edge strand relabeling."""
+        relabel_per_edge = {}
+        next_id_per_edge = {}
+        normalized_paths = []
+
+        for strand_path in strand_solution:
+            normalized = []
+            for e, sid in strand_path:
+                if e not in relabel_per_edge:
+                    relabel_per_edge[e] = {}
+                    next_id_per_edge[e] = 0
+                if sid not in relabel_per_edge[e]:
+                    relabel_per_edge[e][sid] = next_id_per_edge[e]
+                    next_id_per_edge[e] += 1
+                normalized.append((e, relabel_per_edge[e][sid]))
+            normalized_paths.append(tuple(normalized))
+
+        return tuple(sorted(normalized_paths))
+
+    def compute_strand_assignment_cardinality(self, solution_index):
+        """Compute factorial estimate for strand instantiations of one port-level solution."""
+        if not self.solutions:
+            raise ValueError("No solutions computed. Run generate_solutions() first.")
+        if solution_index < 0 or solution_index >= len(self.solutions):
+            raise IndexError(f"solution_index {solution_index} out of range [0, {len(self.solutions)-1}]")
+
+        numerator = 1
+        for e in self.edges.keys():
+            numerator *= math.factorial(self.edge_targets[e])
+
+        denominator = 1
+        for _, multiplicity in self.solutions[solution_index]:
+            denominator *= math.factorial(multiplicity)
+
+        return numerator // denominator
+
+    def generate_strand_solutions(
+        self,
+        solution_index,
+        break_early=None,
+        sort_paths=True,
+        quotient_by_relabeling=False,
+    ):
+        """
+        Enumerate unique strand-level assignments for one port-level solution.
+
+        Returns a list where each strand solution is a tuple of strand paths:
+            ((edge_id, strand_id), (edge_id, strand_id), ...)
+
+        By default, solutions are unique up to path multiplicity ordering only,
+        matching the original instantiate_strands_v1 semantics.
+        Set quotient_by_relabeling=True only if you explicitly want to merge
+        solutions that differ by per-edge strand ID renaming.
+        """
+        if not self.solutions:
+            raise ValueError("No solutions computed. Run generate_solutions() first.")
+        if solution_index < 0 or solution_index >= len(self.solutions):
+            raise IndexError(f"solution_index {solution_index} out of range [0, {len(self.solutions)-1}]")
+
+        edge_counts = self.get_solution_edge_counts(solution_index)
+        if dict(sorted(edge_counts.items())) != dict(sorted(self.edge_targets.items())):
+            raise ValueError(
+                "Port-level solution does not match edge targets, cannot instantiate strand-level solution."
+            )
+
+        path_terms = list(self.solutions[solution_index])
+        if sort_paths:
+            # Longer paths first typically improves pruning.
+            path_terms = sorted(path_terms, key=lambda x: (-len(x[0]), x[0], x[1]))
+
+        edge_ids = list(self.edges.keys())
+        initial_available = {e: list(range(self.edge_targets[e])) for e in edge_ids}
+        strand_solutions = []
+        seen = set()
+
+        def backtrack(term_idx, current_solution, available_now):
+            if break_early is not None and len(strand_solutions) >= break_early:
+                return
+
+            if term_idx == len(path_terms):
+                frozen = tuple(current_solution)
+                if quotient_by_relabeling:
+                    frozen = self._canonicalize_strand_solution(frozen)
+                if frozen not in seen:
+                    seen.add(frozen)
+                    strand_solutions.append(frozen)
+                return
+
+            path, multiplicity = path_terms[term_idx]
+            candidate_ids = [available_now[e][:] for e in path]
+            single_assignments = list(product(*candidate_ids))
+
+            if multiplicity == 1:
+                assignment_groups = [(a,) for a in single_assignments]
+            else:
+                # Use combinations so identical path copies are not over-counted by order.
+                assignment_groups = []
+                for group in combinations(single_assignments, multiplicity):
+                    valid = True
+                    for edge_pos in range(len(path)):
+                        used = {group[m][edge_pos] for m in range(multiplicity)}
+                        if len(used) < multiplicity:
+                            valid = False
+                            break
+                    if valid:
+                        assignment_groups.append(group)
+
+            for group in assignment_groups:
+                available_next = {e: available_now[e][:] for e in edge_ids}
+                updated_solution = list(current_solution)
+                valid_group = True
+
+                for assign in group:
+                    strand_path = []
+                    for edge_pos, e in enumerate(path):
+                        sid = assign[edge_pos]
+                        if sid not in available_next[e]:
+                            valid_group = False
+                            break
+                        available_next[e].remove(sid)
+                        strand_path.append((e, sid))
+                    if not valid_group:
+                        break
+                    updated_solution.append(tuple(strand_path))
+
+                if not valid_group:
+                    continue
+
+                backtrack(term_idx + 1, updated_solution, available_next)
+
+        backtrack(0, [], initial_available)
+        self.strand_solutions[solution_index] = strand_solutions
+        return strand_solutions
+
+    def count_unique_strand_solutions(self, solution_index, break_early=None, quotient_by_relabeling=False):
+        """Return the number of unique strand-level solutions for one port-level solution."""
+        sols = self.generate_strand_solutions(
+            solution_index=solution_index,
+            break_early=break_early,
+            sort_paths=True,
+            quotient_by_relabeling=quotient_by_relabeling,
+        )
+        return len(sols)
+
+    def print_unique_strand_solution_count(self, solution_index, quotient_by_relabeling=False):
+        """Print and return the unique strand-level count for a port-level solution."""
+        count = self.count_unique_strand_solutions(
+            solution_index=solution_index,
+            break_early=None,
+            quotient_by_relabeling=quotient_by_relabeling,
+        )
+        print(f"Port-level solution {solution_index}: {count} unique strand-level solutions")
+        return count
+
+    def generate_all_strand_solutions(self, break_early_per_solution=None, stop_after_solutions=None):
+        """Generate strand-level solutions for all port-level solutions."""
+        if not self.solutions:
+            raise ValueError("No solutions computed. Run generate_solutions() first.")
+
+        generated = {}
+        n = len(self.solutions)
+        if stop_after_solutions is not None:
+            n = min(n, int(stop_after_solutions))
+
+        for idx in range(n):
+            generated[idx] = self.generate_strand_solutions(
+                idx,
+                break_early=break_early_per_solution,
+                sort_paths=True,
+            )
+        return generated
+
+    def print_strand_solution(self, solution_index, strand_solution_index=0):
+        """Print one strand-level solution in readable form."""
+        if solution_index not in self.strand_solutions:
+            self.generate_strand_solutions(solution_index)
+
+        all_strand = self.strand_solutions[solution_index]
+        if not all_strand:
+            print(f"No strand-level solutions found for solution {solution_index}.")
+            return
+        if strand_solution_index < 0 or strand_solution_index >= len(all_strand):
+            raise IndexError(
+                f"strand_solution_index {strand_solution_index} out of range [0, {len(all_strand)-1}]"
+            )
+
+        print("=" * 70)
+        print(f"Port-level solution {solution_index}, strand-level solution {strand_solution_index}")
+        for i, strand_path in enumerate(all_strand[strand_solution_index]):
+            path_str = " -> ".join(f"(e{e}, s{sid})" for e, sid in strand_path)
+            print(f"  path_instance {i}: {path_str}")
+
+    def _draw_base_graph_2d(self, ax, show_edge_ids=False, edge_label_font_size=8):
+        """Draw graph skeleton and node types for plotting helpers."""
+        pos2d = {
+            i: (self.graph.points[i][0], self.graph.points[i][1])
+            for i in range(len(self.graph.points))
+        }
+
+        g = nx.Graph()
+        for node_id in range(len(self.graph.points)):
+            g.add_node(node_id)
+        for _, (n1, n2) in self.edges.items():
+            g.add_edge(n1, n2)
+
+        nx.draw_networkx_edges(g, pos=pos2d, ax=ax, width=1.0, edge_color="lightgray", alpha=0.9)
+
+        port_nodes = [i for i, t in enumerate(self.graph.types) if t == "port"]
+        counterport_nodes = [i for i, t in enumerate(self.graph.types) if t == "counterport"]
+        junction_nodes = [i for i, t in enumerate(self.graph.types) if t == "junction"]
+
+        nx.draw_networkx_nodes(g, pos=pos2d, nodelist=port_nodes, node_color="tab:red", node_size=80, ax=ax)
+        nx.draw_networkx_nodes(g, pos=pos2d, nodelist=counterport_nodes, node_color="tab:blue", node_size=80, ax=ax)
+        nx.draw_networkx_nodes(g, pos=pos2d, nodelist=junction_nodes, node_color="black", node_size=40, ax=ax)
+
+        if show_edge_ids:
+            edge_labels = {(n1, n2): str(e_id) for e_id, (n1, n2) in self.edges.items()}
+            nx.draw_networkx_edge_labels(g, pos=pos2d, edge_labels=edge_labels, font_size=edge_label_font_size, ax=ax)
+
+        return pos2d
+
+    def plot_strand_solution(
+        self,
+        solution_index=0,
+        strand_solution_index=0,
+        figsize=(8, 8),
+        show_edge_ids=False,
+        color_by="instance",
+    ):
+        """Plot one strand-level solution over the lattice geometry."""
+        if solution_index not in self.strand_solutions:
+            self.generate_strand_solutions(solution_index)
+
+        strand_solutions = self.strand_solutions.get(solution_index, [])
+        if not strand_solutions:
+            raise ValueError("No strand-level solutions available for this port-level solution.")
+        if strand_solution_index < 0 or strand_solution_index >= len(strand_solutions):
+            raise IndexError(
+                f"strand_solution_index {strand_solution_index} out of range [0, {len(strand_solutions)-1}]"
+            )
+
+        strand_solution = strand_solutions[strand_solution_index]
+        fig, ax = plt.subplots(figsize=figsize)
+        pos2d = self._draw_base_graph_2d(ax=ax, show_edge_ids=show_edge_ids)
+
+        keys = []
+        for idx, strand_path in enumerate(strand_solution):
+            if color_by == "path":
+                key = tuple(e for e, _ in strand_path)
+            elif color_by == "strand":
+                key = strand_path
+            else:
+                key = idx
+            keys.append(key)
+
+        unique_keys = list(dict.fromkeys(keys))
+        cmap = plt.cm.get_cmap("tab20", max(len(unique_keys), 1))
+        color_lookup = {k: cmap(i) for i, k in enumerate(unique_keys)}
+
+        for idx, strand_path in enumerate(strand_solution):
+            edge_path = tuple(e for e, _ in strand_path)
+            curve_pts = self._get_curved_path_points(edge_path, pos2d, num_points=70)
+            xs = [pt[0] for pt in curve_pts]
+            ys = [pt[1] for pt in curve_pts]
+
+            # Small deterministic jitter separates overlapping strand drawings.
+            jitter_seed = sum((i + 1) * (sid + 1) for i, (_, sid) in enumerate(strand_path))
+            jitter = 0.004 * ((jitter_seed % 9) - 4)
+            color = color_lookup[keys[idx]]
+            ax.plot(xs, [y + jitter for y in ys], color=color, linewidth=2.2, alpha=0.95)
+
+        ax.set_title(f"Strand solution {strand_solution_index} for port solution {solution_index}")
+        ax.set_aspect("equal", adjustable="box")
+        ax.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+    def plot_all_strand_solutions(self, solution_index=0, ncols=3, figsize=(15, 5), show_edge_ids=False):
+        """Plot all strand-level solutions for one port-level solution."""
+        if solution_index not in self.strand_solutions:
+            self.generate_strand_solutions(solution_index)
+
+        strand_solutions = self.strand_solutions.get(solution_index, [])
+        if not strand_solutions:
+            raise ValueError("No strand-level solutions available for this port-level solution.")
+
+        n_solutions = len(strand_solutions)
+        ncols = max(1, int(ncols))
+        nrows = int(np.ceil(n_solutions / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+
+        for idx in range(nrows * ncols):
+            r, c = divmod(idx, ncols)
+            ax = axes[r][c]
+
+            if idx >= n_solutions:
+                ax.axis("off")
+                continue
+
+            pos2d = self._draw_base_graph_2d(ax=ax, show_edge_ids=show_edge_ids, edge_label_font_size=7)
+            strand_solution = strand_solutions[idx]
+            cmap = plt.cm.get_cmap("tab20", max(len(strand_solution), 1))
+
+            for pidx, strand_path in enumerate(strand_solution):
+                edge_path = tuple(e for e, _ in strand_path)
+                curve_pts = self._get_curved_path_points(edge_path, pos2d, num_points=60)
+                xs = [pt[0] for pt in curve_pts]
+                ys = [pt[1] for pt in curve_pts]
+
+                jitter_seed = sum((i + 1) * (sid + 1) for i, (_, sid) in enumerate(strand_path))
+                jitter = 0.004 * ((jitter_seed % 9) - 4)
+                ax.plot(xs, [y + jitter for y in ys], color=cmap(pidx), linewidth=2.0, alpha=0.95)
+
+            ax.set_title(f"Strand {idx}")
+            ax.set_aspect("equal", adjustable="box")
+            ax.axis("off")
+
+        plt.tight_layout()
+        plt.show()
+
     def debug_trace_enumeration(self):
         """
         Trace all sequences through the three-stage pipeline:
@@ -706,7 +1047,7 @@ if __name__ == "__main__":
     # Example usage: heterogeneous targets for first four edges, rest default to zero.
     topo = TopologyMultiEdge(
         filename="lattice_square.dat",
-        edge_targets={0: 2, 1: 1, 2:2, 3: 3},
+        edge_targets={0: 3, 1: 3, 2:1, 3: 1},
         default_edge_target=0,
         conjugacy=False,
         max_multiplicity_path=3,
@@ -725,3 +1066,7 @@ if __name__ == "__main__":
     if topo.solutions:
         # topo.plot_port_solution(solution_index=0)
         topo.plot_all_port_solutions(ncols=3, figsize=(15, 10), show_edge_ids=False)
+
+    topo.generate_strand_solutions(solution_index=2)
+    # topo.print_strand_solution(solution_index=0, strand_solution_index=1)
+    topo.plot_all_strand_solutions(solution_index=2)
